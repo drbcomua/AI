@@ -1,0 +1,13 @@
+# Editor / tooling
+.idea/
+.claude/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Cached MNIST dataset (downloaded on first run)
+01. MNIST/data/
+
+# Generated confusion-matrix figures
+confusion_*.png
