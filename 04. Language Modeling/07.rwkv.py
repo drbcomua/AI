@@ -18,12 +18,19 @@ Key insights / educational takeaways:
     * The WKV state replaces the attention matrix: linear time, constant memory.
     * "Token shift" (mixing each token with the previous one) is a cheap, powerful
       inductive bias; no positional embeddings are needed.
-    * A numerically stable scan (max-tracking) keeps the exponentials from blowing
-      up — the same trick as a log-sum-exp.
+    * The WKV is computed here in parallel "training mode" (one batched T x T op,
+      max-stabilized) — mathematically identical to the sequential recurrence but
+      fast on GPU/MPS. At inference it can instead run as a constant-memory RNN.
+
+Performance note:
+    RWKV's WKV uses a per-channel decay, so (unlike attention) it has no matmul
+    shortcut — it is the most compute-heavy model in this folder. On Apple Silicon
+    it is actually faster on CPU than on MPS for this small size. Use --limit for
+    quick runs.
 
 Run:
-    python "07.rwkv.py" --epochs 5
-    python "07.rwkv.py" --limit 50000 --epochs 2
+    python "07.rwkv.py" --limit 50000 --epochs 2          # quick run
+    python "07.rwkv.py" --device cpu                      # full run (CPU > MPS here)
 """
 
 import os
@@ -60,24 +67,21 @@ class TimeMix(nn.Module):
         B, T, d = x.shape
         w = -torch.exp(self.time_decay)                    # [d] negative decay
         u = self.time_first
-        # numerically stable WKV recurrence (aa/bb = running num/den, pp = running max)
-        aa = torch.zeros(B, d, device=x.device)
-        bb = torch.zeros(B, d, device=x.device)
-        pp = torch.full((B, d), -1e38, device=x.device)
-        out = torch.empty(B, T, d, device=x.device)
-        for t in range(T):
-            kt, vt = k[:, t], v[:, t]
-            ww = u + kt                                    # include current token (bonus u)
-            qq = torch.maximum(pp, ww)
-            e1, e2 = torch.exp(pp - qq), torch.exp(ww - qq)
-            out[:, t] = (e1 * aa + e2 * vt) / (e1 * bb + e2)
-            ww = pp + w                                     # decay the running state
-            qq = torch.maximum(ww, kt)
-            e1, e2 = torch.exp(ww - qq), torch.exp(kt - qq)
-            aa = e1 * aa + e2 * vt
-            bb = e1 * bb + e2
-            pp = qq
-        return self.output(r * out)
+        # WKV in parallel "training mode": equivalent to the recurrence but computed
+        # as one batched T x T operation (no Python loop), so it's fast on GPU/MPS.
+        # weight of key i for query t: exp((t-1-i)*w + k_i) for i<t; exp(u + k_t) at i=t.
+        idx = torch.arange(T, device=x.device)
+        rel = (idx.view(T, 1) - 1 - idx.view(1, T)).float()            # (t-1-i)
+        bias = rel.unsqueeze(-1) * w.view(1, 1, d)                     # [T, T, d] decay (i<t)
+        diag = (idx.view(T, 1) == idx.view(1, T)).unsqueeze(-1)
+        future = (idx.view(1, T) > idx.view(T, 1)).unsqueeze(-1)       # i > t (not allowed)
+        bias = torch.where(diag, u.view(1, 1, d).expand(T, T, d), bias)
+        bias = bias.masked_fill(future, float("-inf"))
+        logits = bias.unsqueeze(0) + k.unsqueeze(1)                    # [B, T, T, d], key index = dim 2
+        m = logits.max(dim=2, keepdim=True).values                    # stabilize exponentials
+        e = torch.exp(logits - m)
+        wkv = (e * v.unsqueeze(1)).sum(dim=2) / e.sum(dim=2)           # [B, T, d]
+        return self.output(r * wkv)
 
 
 class ChannelMix(nn.Module):
