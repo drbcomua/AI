@@ -11,3 +11,4 @@ data/
 
 # Generated figures (never commit graphics)
 *.png
+*.gif
